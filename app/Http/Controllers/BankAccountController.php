@@ -20,7 +20,7 @@ class BankAccountController extends Controller
         private CeilingsClient $ceilings
     ) {}
 
-    // ---------------- Helpers identités / rôles --------------------
+    // ---------------- Helpers identités / rôles ----------------------
 
     /** Identité normalisée (fourni par ContextEnricher) */
     private function externalId(Request $r): ?string {
