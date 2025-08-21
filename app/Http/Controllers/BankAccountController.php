@@ -8,10 +8,11 @@ use App\Services\CeilingsClient;
 use App\Support\Rib;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\QueryException;
-use Illuminate\Database\Eloquent\MassAssignmentException; // ⬅️ AJOUT
+use Illuminate\Database\Eloquent\MassAssignmentException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http; // ⬇️ NEW
 
 class BankAccountController extends Controller
 {
@@ -65,6 +66,65 @@ class BankAccountController extends Controller
             if ($payloadAgencyId && $actorAgency && $payloadAgencyId !== $actorAgency) {
                 abort(response()->json(['error' => 'Forbidden - Cross-agency action'], 403));
             }
+        }
+    }
+
+    // ⬇️ NEW — Ensure local profile in UMS (S2S, non-bloquant)
+    private function s2sEnsureLocalUser(Request $request, string $externalId): void
+    {
+        try {
+            $base   = rtrim((string) env('KEYCLOAK_BASE_URL'), '/');
+            $realm  = (string) env('KEYCLOAK_REALM');
+            $cid    = (string) env('SVC_BANKACCOUNT_ID', 'svc_bankaccount');
+            $secret = (string) env('SVC_BANKACCOUNT_SECRET', '');
+
+            if ($base === '' || $realm === '' || $cid === '' || $secret === '') {
+                // Config incomplète → on log et on n’empêche pas la requête métier
+                Log::warning('um.ensure.config.missing', compact('base','realm','cid'));
+                return;
+            }
+
+            // 1) Récup access_token (client_credentials)
+            $tokenResp = Http::asForm()
+                ->timeout((int) env('HTTP_TIMEOUT', 15))
+                ->retry((int) env('HTTP_RETRIES', 0), (int) env('HTTP_RETRY_SLEEP_MS', 0))
+                ->post("$base/realms/$realm/protocol/openid-connect/token", [
+                    'grant_type'    => 'client_credentials',
+                    'client_id'     => $cid,
+                    'client_secret' => $secret,
+                ])->throw()->json();
+
+            $svcToken = (string) data_get($tokenResp, 'access_token', '');
+
+            if ($svcToken === '') {
+                Log::warning('um.ensure.token.empty');
+                return;
+            }
+
+            // 2) Appel UMS /api/internal/users/ensure (idempotent)
+            $ums = rtrim((string) env('USER_MANAGEMENT_URL'), '/');
+            if ($ums === '') {
+                Log::warning('um.ensure.url.missing');
+                return;
+            }
+
+            Http::timeout((int) env('HTTP_TIMEOUT', 15))
+                ->retry((int) env('HTTP_RETRIES', 0), (int) env('HTTP_RETRY_SLEEP_MS', 0))
+                ->withToken($svcToken)
+                ->post("$ums/api/internal/users/ensure", [
+                    'external_id' => $externalId,
+                ])->throw();
+
+            Log::info('um.ensure.ok', [
+                'request_id'  => $request->header('X-Request-Id'),
+                'external_id' => $externalId,
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('um.ensure.failed', [
+                'request_id'  => $request->header('X-Request-Id'),
+                'external_id' => $externalId,
+                'error'       => $e->getMessage(),
+            ]);
         }
     }
 
@@ -196,6 +256,9 @@ class BankAccountController extends Controller
                 ]);
             }
 
+            // ⬇️ NEW — ensure local profile in UMS (non-bloquant)
+            $this->s2sEnsureLocalUser($request, $externalId);
+
             Log::channel('audit')->info('bankaccount.claimed', [
                 'request_id'  => $request->header('X-Request-Id'),
                 'external_id' => $externalId,
@@ -307,6 +370,9 @@ class BankAccountController extends Controller
                         'error'      => $e->getMessage(),
                     ]);
                 }
+
+                // ⬇️ NEW — ensure local profile en UMS (non-bloquant)
+                $this->s2sEnsureLocalUser($request, $ownerExternalId);
             }
 
             Log::channel('audit')->info('bankaccount.provisioned', [
@@ -338,7 +404,6 @@ class BankAccountController extends Controller
             if ((string) $e->getCode() === '23000') {
                 return response()->json(['error' => 'Bank account already exists'], 409);
             }
-            // ⬇️ détail SQL en 422 pour débogage
             return response()->json([
                 'success'     => false,
                 'error'       => 'SQL error',
@@ -413,6 +478,9 @@ class BankAccountController extends Controller
                     'error'       => $e->getMessage(),
                 ]);
             }
+
+            // ⬇️ NEW — ensure local profile in UMS (non-bloquant)
+            $this->s2sEnsureLocalUser($request, $external);
 
             Log::channel('audit')->info('bankaccount.linked', [
                 'request_id'  => $request->header('X-Request-Id'),

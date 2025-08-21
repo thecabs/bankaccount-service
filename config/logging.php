@@ -71,14 +71,23 @@ return [
         ],
 
         // ====== Canal AUDIT JSON (avec masquage PII) ======
+        // 'audit' => [
+        //     'driver'    => 'single',
+        //     'path'      => storage_path('logs/audit.log'),
+        //     'level'     => env('LOG_AUDIT_LEVEL', 'info'),
+        //     'tap'       => [App\Logging\MaskSensitiveData::class], // applique notre sanitizer
+        //     'formatter' => JsonFormatter::class,
+        //     // 'days'   => 30, // si tu veux passer en daily, crée un canal daily dédié
+        // ],
         'audit' => [
-            'driver'    => 'single',
-            'path'      => storage_path('logs/audit.log'),
-            'level'     => env('LOG_AUDIT_LEVEL', 'info'),
-            'tap'       => [App\Logging\MaskSensitiveData::class], // applique notre sanitizer
-            'formatter' => JsonFormatter::class,
-            // 'days'   => 30, // si tu veux passer en daily, crée un canal daily dédié
-        ],
+    'driver'     => 'daily',
+    'path'       => storage_path('logs/audit.log'),
+    'level'      => env('LOG_LEVEL', 'info'),
+    'days'       => 30,
+    'tap'        => [App\Logging\MaskSensitiveData::class],
+    'processors' => [\Monolog\Processor\PsrLogMessageProcessor::class],
+],
+
 
         // Null channel
         'null' => [

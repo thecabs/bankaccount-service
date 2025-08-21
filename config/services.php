@@ -7,15 +7,22 @@ return [
     | Third Party Services
     |--------------------------------------------------------------------------
     */
-
+ 'ceiling' => [
+        'base_url' => env('USER_CEILING_URL', 'http://127.0.0.1:8081'),
+                'timeout'  => (int) env('HTTP_TIMEOUT', 20),
+ // ex. http://127.0.0.1:8001
+    ],
     'user_management' => [
-        // ⚠️ Uniformisé pour tous les MS: USERM_SERVICE_URL
-        'base_url' => rtrim(env('USERM_SERVICE_URL', 'http://192.168.1.100:8002'), '/'),
+        'base_url' => env('USER_MANAGEMENT_URL', 'http://127.0.0.1:8001'), 
+                'timeout'  => (int) env('HTTP_TIMEOUT', 20),
+// ex. http://localhost:8081/api
     ],
-    'user_ceiling' => [
-        'base_url' => env('USER_CEILING_URL', 'http://127.0.0.1:8001'),
-    ],
-
+     // OAuth pour appels S2S
+        'oauth' => [
+            'token_url'     => rtrim(env('KEYCLOAK_BASE_URL'), '/').'/realms/'.env('KEYCLOAK_REALM').'/protocol/openid-connect/token',
+            'client_id'     => env('SVC_BANKACCOUNT_ID'),
+            'client_secret' => env('SVC_BANKACCOUNT_SECRET'),
+        ],
 
     'keycloak' => [
         'base_url'      => rtrim(env('KEYCLOAK_BASE_URL', 'http://10.10.1.161:30976'), '/'),

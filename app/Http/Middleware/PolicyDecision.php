@@ -11,45 +11,43 @@ class PolicyDecision
 {
     public function handle(Request $request, Closure $next): Response
     {
-        // === Contexte normalisé ===
-        $ctx   = (array) $request->attributes->get('ctx', []);
-        $tags  = array_map('strtoupper', (array) $request->attributes->get('resource_tags', []));
+        // === Contexte normalisé ZT ===
+        $subject = (array) $request->attributes->get('zt.subject', []);
+        $context = (array) $request->attributes->get('zt.context', []);
 
-        $roles    = array_map('strtolower', (array) data_get($ctx, 'actor.roles', []));
-        $agencyId = (string) data_get($ctx, 'actor.agency_id', '');
-        $ip       = $request->ip();
+        $roles    = array_map('strtolower', (array) data_get($subject, 'roles', []));
+        $agencyId = (string) data_get($subject, 'agency_id', '');
+        $acrArr   = (array) data_get($subject, 'acr', []);
+        $acr      = (string) ($acrArr[0] ?? '');
+        $amr      = (array) data_get($subject, 'amr', []);
 
-        // ACR/AMR robustes (string ou array)
-        $acrRaw = data_get($ctx, 'actor.acr', '');
-        $acrArr = is_array($acrRaw) ? $acrRaw : [$acrRaw];
-        $acr    = (string) (is_array($acrRaw) ? ($acrRaw[0] ?? '') : $acrRaw);
-        $amr    = (array)  data_get($ctx, 'actor.amr', []);
+        // Sensibilité posée par ResourceTag
+        $sensitivity = strtoupper((string) $request->attributes->get('zt.resource.sensitivity', 'GENERAL'));
 
-        $devTrust = data_get($ctx, 'device.trust'); // 0..100 ou null
-
-        // Action & sensibilité
-        $method = strtoupper($request->method());
+        // Action
+        $method  = strtoupper($request->method());
         $isWrite = in_array($method, ['POST','PUT','PATCH','DELETE'], true)
-            || strtolower((string) $request->attributes->get('zt.action', '')) === 'write';
+                   || strtolower((string) $request->attributes->get('zt.action', '')) === 'write';
 
-        $sensitivity = 'GENERAL';
-        if (in_array('FINANCIAL', $tags, true)) $sensitivity = 'FINANCIAL';
-        if (in_array('PII',        $tags, true)) $sensitivity = 'PII';
+        // Device trust / risk (optionnels: si non posés, restent null/0)
+        $deviceTrust = data_get($context, 'device.trust', null);
+        $risk        = (int) data_get($context, 'risk', 0);
+        $hour        = (int) (data_get($context, 'hour', now()->hour));
 
         // Token de service (client_credentials) via azp whitelist
-        $tok      = (array) $request->attributes->get('token_data', []);
-        $clientId = strtolower((string) data_get($tok, 'azp', ''));
+        $tok         = (array) $request->attributes->get('token_data', []);
+        $clientId    = strtolower((string) data_get($tok, 'azp', ''));
         $svcWhitelist = array_map('strtolower', (array) config('http.pdp.service_bypass_azp', []));
         $isServiceToken = $clientId !== '' && in_array($clientId, $svcWhitelist, true);
 
         // Bypass par rôles (admin/svc_*)
-        $allowBypassRoles = array_map('strtolower', (array) config('http.pdp.admin_bypass_roles', []));
+        $allowBypassRoles  = array_map('strtolower', (array) config('http.pdp.admin_bypass_roles', ['admin','svc_bankaccount']));
         $isAdminBypassRole = (bool) array_intersect($roles, $allowBypassRoles);
 
         // Politique : exiger MFA pour écriture FINANCIAL (humains), activable par conf
         $requireMfaOnAdminWrites = (bool) config('http.pdp.require_mfa_for_admin_financial_writes', false);
 
-        // Détection MFA
+        // Détection MFA robuste
         $hasMfa = $this->hasMfa($acr, $acrArr, $amr);
 
         // ===== Décision par défaut =====
@@ -59,13 +57,9 @@ class PolicyDecision
 
         // ===== Règles FINANCIAL =====
         if ($sensitivity === 'FINANCIAL') {
-            // 1) Tokens de service : toujours OK (décisions auditées ailleurs)
-            if ($isServiceToken) {
-                // rien
-            }
-            // 2) Humains
-            else {
-                // 2.a) Écritures : exigence MFA configurable (admin compris)
+            if ($isServiceToken || $isAdminBypassRole) {
+                // allow, mais on logue
+            } else {
                 if ($isWrite && $requireMfaOnAdminWrites) {
                     if (!$hasMfa) {
                         $decision   = 'deny';
@@ -73,10 +67,8 @@ class PolicyDecision
                         $obligation = ['type' => 'mfa', 'acr_values' => 'mfa'];
                     }
                 } else {
-                    // 2.b) Lectures (ou écriture sans durcissement)
-                    // Si tu veux exiger device_trust minimal, active ce bloc
                     $minTrust = (int) config('http.pdp.financial_min_device_trust', 0);
-                    if ($minTrust > 0 && $devTrust !== null && $devTrust < $minTrust) {
+                    if ($minTrust > 0 && $deviceTrust !== null && $deviceTrust < $minTrust) {
                         $decision   = 'deny';
                         $reason     = 'low_device_trust';
                         $obligation = ['type' => 'device_trust', 'min' => $minTrust];
@@ -85,31 +77,29 @@ class PolicyDecision
             }
         }
 
-        // ===== Logs d’audit (toujours) =====
+        // ===== Logs d’audit =====
         $logPayload = [
             'request_id' => $request->headers->get('X-Request-Id'),
-            'sub'        => data_get($ctx, 'actor.sub'),
+            'sub'        => data_get($subject, 'sub'),
             'roles'      => $roles,
             'agency_id'  => $agencyId,
             'action'     => $isWrite ? 'write' : 'read',
             'sensitivity'=> $sensitivity,
-            'risk'       => (int) data_get($ctx, 'risk', 0),
+            'risk'       => $risk,
             'obligations'=> $obligation ?? [],
             'acr'        => $acrArr,
             'amr'        => $amr,
             'has_mfa'    => $hasMfa,
-            'hour'       => (int) (data_get($ctx, 'hour', now()->hour)),
-            'ip'         => $ip,
+            'hour'       => $hour,
+            'ip'         => $request->ip(),
             'azp'        => $clientId,
             'service'    => $isServiceToken,
             'decision'   => $decision,
             'reason'     => $reason,
             'path'       => $request->path(),
             'method'     => $method,
-            'tags'       => $tags,
         ];
         Log::channel('audit')->info('pdp.decision', $logPayload);
-        Log::info('pdp.decision', $logPayload); // si tu gardes aussi sur le canal 'local'
 
         if ($decision === 'deny') {
             return response()->json([
@@ -122,27 +112,20 @@ class PolicyDecision
         return $next($request);
     }
 
-    /**
-     * Détermine la présence MFA de façon robuste.
-     * - acr string: 'mfa' ou entier >= 2
-     * - acr array : contient 'mfa' ou un entier >= 2
-     * - amr       : contient 'otp'
-     */
     private function hasMfa(string $acr, array $acrArr, array $amr): bool
     {
-        // cas string simple
         if ($acr === 'mfa') return true;
         if (ctype_digit($acr) && (int) $acr >= 2) return true;
 
-        // cas array d'ACR
         foreach ($acrArr as $a) {
             if ($a === 'mfa') return true;
             if (is_string($a) && ctype_digit($a) && (int) $a >= 2) return true;
         }
 
-        // AMR
-        if (in_array('otp', $amr, true)) return true;
-
+        $amrLower = array_map('strtolower', $amr);
+        foreach (['otp','totp','webauthn','hwk','sms','email'] as $factor) {
+            if (in_array($factor, $amrLower, true)) return true;
+        }
         return false;
     }
 }

@@ -2,73 +2,79 @@
 
 namespace App\Logging;
 
-use Monolog\Formatter\JsonFormatter;
-use Monolog\Level;
+use Illuminate\Log\Logger as IlluminateLogger;
+use Monolog\Logger as MonologLogger;
 use Monolog\LogRecord;
 
-class MaskSensitiveData extends JsonFormatter
+class MaskSensitiveData
 {
-    /** clés masquées (minuscule) */
-    private array $maskKeys = [
-        'authorization','access_token','refresh_token','token','client_secret','password',
-        'cle_rib','numero_compte','identifiant_national','identifiant_national_hash',
-        'telephone_reference','meta_core_ref','x-api-key','api_key',
-    ];
-
-    public function __construct()
+    /**
+     * Tap du logger.
+     * Laravel peut appeler __invoke($logger, $channelName) => 2 args.
+     */
+    public function __invoke(IlluminateLogger $logger, ?string $channel = null): void
     {
-        // Laisse la config par défaut de JsonFormatter (Monolog v3)
-        parent::__construct();
+        // Récupère le Monolog\Logger sous-jacent si possible
+        $monolog = method_exists($logger, 'getLogger')
+            ? $logger->getLogger()
+            : (method_exists($logger, 'getMonolog') ? $logger->getMonolog() : null);
+
+        // Cible pour pushProcessor: le Monolog natif si dispo, sinon le wrapper Illuminate
+        $target = ($monolog instanceof MonologLogger) ? $monolog : $logger;
+
+        $target->pushProcessor(function ($record) {
+            // Monolog v3
+            if ($record instanceof LogRecord) {
+                return $record->with(
+                    context: $this->maskArray($record->context),
+                    extra:   $this->maskArray($record->extra)
+                );
+            }
+            // Monolog v2 (tableau)
+            if (is_array($record)) {
+                $record['context'] = $this->maskArray($record['context'] ?? []);
+                $record['extra']   = $this->maskArray($record['extra'] ?? []);
+                return $record;
+            }
+            return $record;
+        });
     }
 
-    /** Monolog v3: reçoit un LogRecord (pas un array) */
-    public function format(LogRecord $record): string
+    private function maskArray(array $data): array
     {
-        // Masquer dans message/ctx/extra
-        $msg    = $this->maskString($record->message);
-        $ctx    = $this->maskArray($record->context);
-        $extra  = $this->maskArray($record->extra);
+        $keysToMask = [
+            'authorization','token','access_token','refresh_token','id_token',
+            'password','secret','client_secret','otp','totp','code','pin',
+            'phone','telephone','email',
+            'fp','fingerprint',
+        ];
 
-        // Recrée un LogRecord masqué puis délègue à JsonFormatter
-        $masked = new LogRecord(
-            $record->datetime,
-            $record->channel,
-            $record->level instanceof Level ? $record->level : Level::from($record->level->value),
-            $msg,
-            $ctx,
-            $extra
-        );
-
-        return parent::format($masked);
-    }
-
-    /* ---------------- helpers ---------------- */
-
-    private function maskArray(array $a): array
-    {
-        foreach ($a as $k => $v) {
-            if (is_array($v)) { $a[$k] = $this->maskArray($v); continue; }
-            if ($this->shouldMask((string)$k) && is_scalar($v)) {
-                $a[$k] = $this->maskString((string)$v);
+        $masked = [];
+        foreach ($data as $k => $v) {
+            if (is_array($v)) { $masked[$k] = $this->maskArray($v); continue; }
+            if (is_string($k) && $this->needsMask($k, $keysToMask)) {
+                $masked[$k] = $this->maskValue($v);
+            } else {
+                $masked[$k] = $v;
             }
         }
-        return $a;
+        return $masked;
     }
 
-    private function shouldMask(string $key): bool
+    private function needsMask(string $key, array $targets): bool
     {
-        $k = strtolower($key);
-        if (in_array($k, $this->maskKeys, true)) return true;
-        // règles génériques
-        return (bool) preg_match('/(secret|token|pass|authorization|cle|rib)/i', $k);
+        $lk = strtolower($key);
+        foreach ($targets as $t) {
+            if (str_contains($lk, strtolower($t))) return true;
+        }
+        return false;
     }
 
-    private function maskString(string $v): string
+    private function maskValue(mixed $v): mixed
     {
-        $v = trim($v);
-        if ($v === '') return '';
+        if (!is_string($v)) return $v;
         $len = strlen($v);
-        if ($len <= 8) return str_repeat('*', $len);
-        return substr($v, 0, 4) . str_repeat('*', max(0, $len - 8)) . substr($v, -4);
+        if ($len <= 6) return str_repeat('*', $len);
+        return substr($v, 0, 2) . str_repeat('*', max(0, $len - 6)) . substr($v, -4);
     }
 }
